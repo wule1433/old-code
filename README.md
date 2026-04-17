@@ -7,7 +7,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-Skill-blueviolet)](https://claude.ai/code)
-[![old-code](https://img.shields.io/badge/Made%20with-古法编程.skill-orange)](https://github.com/zjw_swun/old-code)
+[![old-code](https://img.shields.io/badge/Made%20with-古法编程.skill-orange)](https://github.com/zjw-swun/old-code)
 
 ---
 
