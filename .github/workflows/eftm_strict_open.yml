@@ -23,9 +23,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install 'huggingface_hub[hf_xet]>=0.34' pandas numpy pyarrow
-      - name: Restore exact strict-open builder
+      - name: Restore strict-open builder and apply schema-only adapter fix
         run: |
           base64 -d eftm_strict_open/build_strict_open_dataset.py.gz.b64 | gzip -d > eftm_strict_open/build_strict_open_dataset.py
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('eftm_strict_open/build_strict_open_dataset.py')
+          s=p.read_text()
+          old="dataset=ds.dataset(str(d),format='parquet',partitioning='hive')"
+          new="dataset=ds.dataset(str(d),format='parquet')"
+          assert old in s
+          p.write_text(s.replace(old,new))
+          PY
           python -m py_compile eftm_strict_open/fetch_strict_open_sources.py eftm_strict_open/build_strict_open_dataset.py
       - name: Disk before
         run: df -h
