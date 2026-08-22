@@ -3,6 +3,8 @@ name: EFTM strict-open data build
 on:
   push:
     branches: [eftm-strict-open-20260822]
+  pull_request:
+    branches: [master]
 
 jobs:
   build:
