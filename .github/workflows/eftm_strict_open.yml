@@ -1,0 +1,50 @@
+name: EFTM strict-open data build
+
+on:
+  push:
+    branches: [eftm-strict-open-20260822]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_HUB_DOWNLOAD_TIMEOUT: '1800'
+      HF_HUB_ETAG_TIMEOUT: '120'
+      HF_XET_HIGH_PERFORMANCE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'huggingface_hub[hf_xet]>=0.34' pandas numpy pyarrow
+      - name: Restore exact strict-open builder
+        run: |
+          base64 -d eftm_strict_open/build_strict_open_dataset.py.gz.b64 | gzip -d > eftm_strict_open/build_strict_open_dataset.py
+          python -m py_compile eftm_strict_open/fetch_strict_open_sources.py eftm_strict_open/build_strict_open_dataset.py
+      - name: Disk before
+        run: df -h
+      - name: Fetch CC-BY-4.0 sources
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/eftm_run/qa"
+          python eftm_strict_open/fetch_strict_open_sources.py --root "$GITHUB_WORKSPACE/eftm_run"
+      - name: Build strict-open model input
+        run: python eftm_strict_open/build_strict_open_dataset.py --root "$GITHUB_WORKSPACE/eftm_run"
+      - name: Summarize outputs
+        run: |
+          ls -lh eftm_run/earnings_dataset_v1.1_strict_open.csv
+          cat eftm_run/qa/STRICT_OPEN_DATA_QUALITY.json
+          df -h
+      - name: Upload compact build outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: eftm-strict-open-built-data
+          retention-days: 3
+          compression-level: 6
+          path: |
+            eftm_run/earnings_dataset_v1.1_strict_open.csv
+            eftm_run/SOURCE_LICENSE_MANIFEST.runtime.json
+            eftm_run/qa/STRICT_OPEN_DATA_QUALITY.json
