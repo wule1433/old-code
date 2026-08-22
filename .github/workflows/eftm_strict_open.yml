@@ -1,4 +1,4 @@
-name: EFTM strict-open data build
+name: EFTM strict-open schema diagnostic
 
 on:
   push:
@@ -7,9 +7,9 @@ on:
     branches: [master]
 
 jobs:
-  build:
+  diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 90
     env:
       HF_HUB_DOWNLOAD_TIMEOUT: '1800'
       HF_HUB_ETAG_TIMEOUT: '120'
@@ -23,39 +23,74 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install 'huggingface_hub[hf_xet]>=0.34' pandas numpy pyarrow
-      - name: Restore strict-open builder and apply schema-only adapter fix
-        run: |
-          base64 -d eftm_strict_open/build_strict_open_dataset.py.gz.b64 | gzip -d > eftm_strict_open/build_strict_open_dataset.py
-          python - <<'PY'
-          from pathlib import Path
-          p=Path('eftm_strict_open/build_strict_open_dataset.py')
-          s=p.read_text()
-          old="dataset=ds.dataset(str(d),format='parquet',partitioning='hive')"
-          new="dataset=ds.dataset(str(d),format='parquet')"
-          assert old in s
-          p.write_text(s.replace(old,new))
-          PY
-          python -m py_compile eftm_strict_open/fetch_strict_open_sources.py eftm_strict_open/build_strict_open_dataset.py
-      - name: Disk before
-        run: df -h
-      - name: Fetch CC-BY-4.0 sources
+      - name: Fetch the same strict-open sources
         run: |
           mkdir -p "$GITHUB_WORKSPACE/eftm_run/qa"
           python eftm_strict_open/fetch_strict_open_sources.py --root "$GITHUB_WORKSPACE/eftm_run"
-      - name: Build strict-open model input
-        run: python eftm_strict_open/build_strict_open_dataset.py --root "$GITHUB_WORKSPACE/eftm_run"
-      - name: Summarize outputs
+      - name: Diagnose speb and LEDGER schemas
         run: |
-          ls -lh eftm_run/earnings_dataset_v1.1_strict_open.csv
-          cat eftm_run/qa/STRICT_OPEN_DATA_QUALITY.json
-          df -h
-      - name: Upload compact build outputs
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd
+          import pyarrow.parquet as pq
+          import json
+
+          root=Path('eftm_run/source_data')
+          sr=root/'speb'/'raw'
+          targets=['AMD','AAPL','MSFT','NVDA','AVGO','QCOM','MU','INTC','AMAT','LRCX','KLAC','MRVL','MCHP','ADI','NXPI','ON']
+          out={}
+
+          def inspect(name):
+              p=sr/name
+              sch=pq.read_schema(p)
+              rec={'columns':sch.names}
+              df=pd.read_parquet(p)
+              rec['rows']=len(df)
+              sym=next((c for c in df.columns if c.lower()=='symbol'),None)
+              if sym:
+                  x=df[df[sym].astype(str).str.upper().isin(targets)].copy()
+                  rec['target_rows']=len(x)
+                  rec['target_counts']=x[sym].astype(str).str.upper().value_counts().to_dict()
+                  rec['target_sample']=x.head(25).astype(str).to_dict('records')
+              for c in df.columns:
+                  lc=c.lower()
+                  if any(k in lc for k in ['time','period_type','estimate_type','sector','industry','fiscal','report_date','period','date']):
+                      try:
+                          rec.setdefault('value_counts',{})[c]=df[c].dropna().astype(str).value_counts().head(30).to_dict()
+                      except Exception:
+                          pass
+              return rec
+
+          for fn in ['stock_profile.parquet','stock_earnings_history.parquet','stock_earning_calendar.parquet','stock_statement.parquet','stock_earnings_estimates.parquet']:
+              out[fn]=inspect(fn)
+
+          lp=root/'ledger'/'eps_surprise'/'data.parquet'
+          ldf=pd.read_parquet(lp)
+          out['ledger_eps']={
+              'rows':len(ldf),
+              'columns':list(ldf.columns),
+              'earnings_date_sample':ldf['earnings_date'].astype(str).head(30).tolist() if 'earnings_date' in ldf else [],
+              'earnings_date_hour_counts':pd.to_datetime(ldf['earnings_date'],errors='coerce',utc=True).dt.hour.value_counts().sort_index().to_dict() if 'earnings_date' in ldf else {}
+          }
+          pp=sr/'stock_prices'
+          files=sorted(pp.rglob('*.parquet'))
+          if files:
+              out['price_file_count']=len(files)
+              out['price_first_schema']=pq.read_schema(files[0]).names
+              samples=[]
+              for f in files[:10]:
+                  d=pd.read_parquet(f)
+                  if 'symbol' in d:
+                      z=d[d.symbol.astype(str).str.upper().isin(targets)]
+                      if len(z): samples.extend(z.head(10).astype(str).to_dict('records'))
+              out['price_target_sample']=samples[:30]
+          Path('eftm_run/qa/SCHEMA_DIAGNOSTIC.json').write_text(json.dumps(out,indent=2,ensure_ascii=False),encoding='utf-8')
+          print(json.dumps(out,indent=2,ensure_ascii=False)[:200000])
+          PY
+      - name: Upload diagnostic
         uses: actions/upload-artifact@v4
         with:
-          name: eftm-strict-open-built-data
+          name: eftm-strict-open-schema-diagnostic
           retention-days: 3
-          compression-level: 6
-          path: |
-            eftm_run/earnings_dataset_v1.1_strict_open.csv
-            eftm_run/SOURCE_LICENSE_MANIFEST.runtime.json
-            eftm_run/qa/STRICT_OPEN_DATA_QUALITY.json
+          compression-level: 9
+          path: eftm_run/qa/SCHEMA_DIAGNOSTIC.json
