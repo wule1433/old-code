@@ -1,4 +1,4 @@
-name: EFTM strict-open schema diagnostic
+name: EFTM strict-open corrected build
 
 on:
   push:
@@ -7,9 +7,9 @@ on:
     branches: [master]
 
 jobs:
-  diagnose:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       HF_HUB_DOWNLOAD_TIMEOUT: '1800'
       HF_HUB_ETAG_TIMEOUT: '120'
@@ -23,74 +23,44 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install 'huggingface_hub[hf_xet]>=0.34' pandas numpy pyarrow
-      - name: Fetch the same strict-open sources
+      - name: Restore original builder and apply data-semantics adapter
+        run: |
+          base64 -d eftm_strict_open/build_strict_open_dataset.py.gz.b64 | gzip -d > eftm_strict_open/build_strict_open_dataset.py
+          python eftm_strict_open/patch_builder_v2.py
+          python -m py_compile eftm_strict_open/fetch_strict_open_sources.py eftm_strict_open/build_strict_open_dataset.py
+      - name: Fetch CC-BY-4.0 sources
         run: |
           mkdir -p "$GITHUB_WORKSPACE/eftm_run/qa"
           python eftm_strict_open/fetch_strict_open_sources.py --root "$GITHUB_WORKSPACE/eftm_run"
-      - name: Diagnose speb and LEDGER schemas
+      - name: Build corrected strict-open model input
+        run: python eftm_strict_open/build_strict_open_dataset.py --root "$GITHUB_WORKSPACE/eftm_run"
+      - name: Enforce pre-training data gates
         run: |
           python - <<'PY'
-          from pathlib import Path
-          import pandas as pd
-          import pyarrow.parquet as pq
-          import json
-
-          root=Path('eftm_run/source_data')
-          sr=root/'speb'/'raw'
-          targets=['AMD','AAPL','MSFT','NVDA','AVGO','QCOM','MU','INTC','AMAT','LRCX','KLAC','MRVL','MCHP','ADI','NXPI','ON']
-          out={}
-
-          def inspect(name):
-              p=sr/name
-              sch=pq.read_schema(p)
-              rec={'columns':sch.names}
-              df=pd.read_parquet(p)
-              rec['rows']=len(df)
-              sym=next((c for c in df.columns if c.lower()=='symbol'),None)
-              if sym:
-                  x=df[df[sym].astype(str).str.upper().isin(targets)].copy()
-                  rec['target_rows']=len(x)
-                  rec['target_counts']=x[sym].astype(str).str.upper().value_counts().to_dict()
-                  rec['target_sample']=x.head(25).astype(str).to_dict('records')
-              for c in df.columns:
-                  lc=c.lower()
-                  if any(k in lc for k in ['time','period_type','estimate_type','sector','industry','fiscal','report_date','period','date']):
-                      try:
-                          rec.setdefault('value_counts',{})[c]=df[c].dropna().astype(str).value_counts().head(30).to_dict()
-                      except Exception:
-                          pass
-              return rec
-
-          for fn in ['stock_profile.parquet','stock_earnings_history.parquet','stock_earning_calendar.parquet','stock_statement.parquet','stock_earnings_estimates.parquet']:
-              out[fn]=inspect(fn)
-
-          lp=root/'ledger'/'eps_surprise'/'data.parquet'
-          ldf=pd.read_parquet(lp)
-          out['ledger_eps']={
-              'rows':len(ldf),
-              'columns':list(ldf.columns),
-              'earnings_date_sample':ldf['earnings_date'].astype(str).head(30).tolist() if 'earnings_date' in ldf else [],
-              'earnings_date_hour_counts':pd.to_datetime(ldf['earnings_date'],errors='coerce',utc=True).dt.hour.value_counts().sort_index().to_dict() if 'earnings_date' in ldf else {}
+          import json,sys
+          q=json.load(open('eftm_run/qa/STRICT_OPEN_DATA_QUALITY.json'))
+          print(json.dumps(q,indent=2))
+          gates={
+            'events_ge_3000': q['rows']>=3000,
+            'amd_present': q['amd_rows']>0,
+            'semiconductors_present': len(q['semiconductor_counts'])>0,
+            'revenue_actual_or_margin_present': max(q['feature_nonnull_rates']['revenueAct_YoY'],q['feature_nonnull_rates']['netProfitMargin'],q['feature_nonnull_rates']['netProfitMargin_ttm_y'])>0,
+            'no_unknown_license_mirror': not q['license_unknown_earnings_mirror_used'],
+            'no_duplicate_events': q['duplicates_symbol_earnReportedDate']==0 and q['duplicates_symbol_amcEquivalentDate']==0,
           }
-          pp=sr/'stock_prices'
-          files=sorted(pp.rglob('*.parquet'))
-          if files:
-              out['price_file_count']=len(files)
-              out['price_first_schema']=pq.read_schema(files[0]).names
-              samples=[]
-              for f in files[:10]:
-                  d=pd.read_parquet(f)
-                  if 'symbol' in d:
-                      z=d[d.symbol.astype(str).str.upper().isin(targets)]
-                      if len(z): samples.extend(z.head(10).astype(str).to_dict('records'))
-              out['price_target_sample']=samples[:30]
-          Path('eftm_run/qa/SCHEMA_DIAGNOSTIC.json').write_text(json.dumps(out,indent=2,ensure_ascii=False),encoding='utf-8')
-          print(json.dumps(out,indent=2,ensure_ascii=False)[:200000])
+          print('GATES',json.dumps(gates,indent=2))
+          open('eftm_run/qa/PRETRAIN_GATES.json','w').write(json.dumps(gates,indent=2))
+          if not all(gates.values()): sys.exit(2)
           PY
-      - name: Upload diagnostic
+      - name: Upload compact build outputs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: eftm-strict-open-schema-diagnostic
+          name: eftm-strict-open-corrected-built-data
           retention-days: 3
-          compression-level: 9
-          path: eftm_run/qa/SCHEMA_DIAGNOSTIC.json
+          compression-level: 6
+          path: |
+            eftm_run/earnings_dataset_v1.1_strict_open.csv
+            eftm_run/SOURCE_LICENSE_MANIFEST.runtime.json
+            eftm_run/qa/STRICT_OPEN_DATA_QUALITY.json
+            eftm_run/qa/PRETRAIN_GATES.json
