@@ -21,32 +21,24 @@ jobs:
         run: |
           mkdir -p eftm_v12_sec_plos
           python - <<'PY'
-          import requests, zipfile, io, pandas as pd, json, time, re
+          import requests, zipfile, io, pandas as pd, json, time
           from pathlib import Path
           from datetime import datetime
           from zoneinfo import ZoneInfo
           out=Path('eftm_v12_sec_plos')
           S=requests.Session(); headers={'User-Agent':'EFTM academic research contact research@example.com','Accept-Encoding':'gzip, deflate'}
-
           meta=S.get('https://api.figshare.com/v2/articles/4036269',timeout=60).json()
           assert meta.get('license',{}).get('name')=='CC BY 4.0'
           f=next(x for x in meta['files'] if x['name']=='data_for_paper.zip')
           b=S.get(f['download_url'],timeout=120).content
-          z=zipfile.ZipFile(io.BytesIO(b)); ea=pd.read_csv(z.open('EA_data.csv'))
-          ea['Date']=pd.to_datetime(ea['Date'])
-
+          z=zipfile.ZipFile(io.BytesIO(b)); ea=pd.read_csv(z.open('EA_data.csv')); ea['Date']=pd.to_datetime(ea['Date'])
           tick=S.get('https://www.sec.gov/files/company_tickers.json',headers=headers,timeout=60).json()
-          tmap={v['ticker'].upper():str(v['cik_str']).zfill(10) for v in tick.values()}
-          # historical aliases from the 2013-2016 DJIA sample when current ticker disappeared
-          aliases={'UTX':'RTX'}
+          tmap={v['ticker'].upper():str(v['cik_str']).zfill(10) for v in tick.values()}; aliases={'UTX':'RTX'}
           all_sec=[]; unavailable=[]
           for ticker in sorted(ea.Company.unique()):
-              lookup=aliases.get(ticker,ticker)
-              cik=tmap.get(lookup)
-              if not cik:
-                  unavailable.append(ticker); continue
-              sub=S.get(f'https://data.sec.gov/submissions/CIK{cik}.json',headers=headers,timeout=60).json()
-              sets=[sub.get('filings',{}).get('recent',{})]
+              cik=tmap.get(aliases.get(ticker,ticker))
+              if not cik: unavailable.append(ticker); continue
+              sub=S.get(f'https://data.sec.gov/submissions/CIK{cik}.json',headers=headers,timeout=60).json(); sets=[sub.get('filings',{}).get('recent',{})]
               for fref in sub.get('filings',{}).get('files',[]):
                   name=fref.get('name')
                   if name:
@@ -62,8 +54,7 @@ jobs:
                       adt=g('acceptanceDateTime'); local=None; cls='unknown'
                       if adt:
                           try:
-                              dt=datetime.fromisoformat(str(adt).replace('Z','+00:00')).astimezone(ZoneInfo('America/New_York'))
-                              local=dt.isoformat(); h=dt.hour+dt.minute/60
+                              dt=datetime.fromisoformat(str(adt).replace('Z','+00:00')).astimezone(ZoneInfo('America/New_York')); local=dt.isoformat(); h=dt.hour+dt.minute/60
                               cls='BeforeOpen' if h<9.5 else ('AfterClose' if h>=16 else 'Intraday')
                           except Exception: pass
                       all_sec.append({'Company':ticker,'filingDate':g('filingDate'),'acceptanceDateTime_utc':adt,'acceptanceDateTime_et':local,'SEC_class':cls,'accessionNumber':g('accessionNumber')})
@@ -72,33 +63,17 @@ jobs:
           matches=[]
           for _,r in ea.iterrows():
               s=sec[sec.Company.eq(r.Company)].copy()
-              if r.Timing=='AfterClose':
-                  # PLOS marks the response trading date for after-close cases; search same/prior 4 calendar days.
-                  cand=s[(s.filingDate<=r.Date)&(s.filingDate>=r.Date-pd.Timedelta(days=4))].sort_values('filingDate',ascending=False)
+              if r.Timing=='AfterClose': cand=s[(s.filingDate<=r.Date)&(s.filingDate>=r.Date-pd.Timedelta(days=4))].sort_values('filingDate',ascending=False)
               else:
                   cand=s[(s.filingDate>=r.Date-pd.Timedelta(days=1))&(s.filingDate<=r.Date+pd.Timedelta(days=1))].copy()
                   if len(cand): cand['dist']=(cand.filingDate-r.Date).abs(); cand=cand.sort_values(['dist','filingDate'])
               if len(cand):
-                  q=cand.iloc[0]
-                  date_delta=(r.Date-q.filingDate).days
-                  matches.append({**r.to_dict(),'sec_filingDate':q.filingDate.date().isoformat(),'sec_acceptance_utc':q.acceptanceDateTime_utc,'sec_acceptance_et':q.acceptanceDateTime_et,'SEC_class':q.SEC_class,'date_delta_days':date_delta,'class_agree':q.SEC_class==r.Timing,'accessionNumber':q.accessionNumber})
-              else:
-                  matches.append({**r.to_dict(),'sec_filingDate':None,'SEC_class':None,'date_delta_days':None,'class_agree':None})
-          m=pd.DataFrame(matches)
-          m.to_csv(out/'plos_sec_timing_matches.csv',index=False)
-          matched=m[m.SEC_class.notna()].copy(); classified=matched[matched.SEC_class.isin(['BeforeOpen','AfterClose'])]
-          stats={
-            'plos_rows':len(ea),'companies':int(ea.Company.nunique()),'unavailable_companies':unavailable,
-            'matched_rows':len(matched),'classified_rows':len(classified),
-            'overall_class_agreement':float(classified.class_agree.mean()) if len(classified) else None,
-            'by_timing': classified.groupby('Timing').class_agree.agg(['count','mean']).reset_index().to_dict('records') if len(classified) else [],
-            'by_company': classified.groupby('Company').class_agree.agg(['count','mean']).reset_index().sort_values(['count','mean'],ascending=[False,False]).to_dict('records') if len(classified) else [],
-            'date_delta_counts':matched.date_delta_days.value_counts(dropna=False).sort_index().to_dict(),
-            'disagreements':classified[~classified.class_agree].astype(str).to_dict('records'),
-            'msft_matches':m[m.Company.eq('MSFT')].astype(str).to_dict('records')
-          }
-          (out/'SEC_PLOS_VALIDATION.json').write_text(json.dumps(stats,indent=2,ensure_ascii=False),encoding='utf-8')
-          print(json.dumps(stats,indent=2,ensure_ascii=False)[:200000])
+                  q=cand.iloc[0]; matches.append({**r.to_dict(),'sec_filingDate':q.filingDate.date().isoformat(),'sec_acceptance_utc':q.acceptanceDateTime_utc,'sec_acceptance_et':q.acceptanceDateTime_et,'SEC_class':q.SEC_class,'date_delta_days':(r.Date-q.filingDate).days,'class_agree':bool(q.SEC_class==r.Timing),'accessionNumber':q.accessionNumber})
+              else: matches.append({**r.to_dict(),'sec_filingDate':None,'SEC_class':None,'date_delta_days':None,'class_agree':None})
+          m=pd.DataFrame(matches); m.to_csv(out/'plos_sec_timing_matches.csv',index=False)
+          matched=m[m.SEC_class.notna()].copy(); classified=matched[matched.SEC_class.isin(['BeforeOpen','AfterClose'])].copy(); classified['class_agree']=classified['class_agree'].astype(bool)
+          stats={'plos_rows':len(ea),'companies':int(ea.Company.nunique()),'unavailable_companies':unavailable,'matched_rows':len(matched),'classified_rows':len(classified),'overall_class_agreement':float(classified.class_agree.mean()) if len(classified) else None,'by_timing':classified.groupby('Timing').class_agree.agg(['count','mean']).reset_index().to_dict('records') if len(classified) else [],'by_company':classified.groupby('Company').class_agree.agg(['count','mean']).reset_index().sort_values(['count','mean'],ascending=[False,False]).to_dict('records') if len(classified) else [],'date_delta_counts':{str(k):int(v) for k,v in matched.date_delta_days.value_counts(dropna=False).sort_index().items()},'disagreements':classified[classified.class_agree.eq(False)].astype(str).to_dict('records'),'msft_matches':m[m.Company.eq('MSFT')].astype(str).to_dict('records')}
+          (out/'SEC_PLOS_VALIDATION.json').write_text(json.dumps(stats,indent=2,ensure_ascii=False),encoding='utf-8'); print(json.dumps(stats,indent=2,ensure_ascii=False)[:200000])
           PY
       - name: Upload
         uses: actions/upload-artifact@v4
