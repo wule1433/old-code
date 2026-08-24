@@ -6,6 +6,11 @@ on:
     paths:
       - '.github/workflows/eftm_v12_coverage.yml'
       - 'eftm_v12/**'
+  pull_request:
+    branches: [master]
+    paths:
+      - '.github/workflows/eftm_v12_coverage.yml'
+      - 'eftm_v12/**'
 
 jobs:
   audit:
@@ -22,10 +27,9 @@ jobs:
         run: |
           mkdir -p eftm_v12_out
           python - <<'PY'
-          import json, re, time, zipfile, io, os
+          import json, re, time
           from pathlib import Path
           import requests, pandas as pd
-          from zoneinfo import ZoneInfo
           from datetime import datetime
 
           OUT=Path('eftm_v12_out')
@@ -34,7 +38,6 @@ jobs:
           S.headers.update({'User-Agent':'EFTM academic research contact research@example.com'})
           audit={'figshare':{},'sec':{},'targets':TARGETS}
 
-          # ---- PLOS Figshare collection ----
           coll=3703099
           u=f'https://api.figshare.com/v2/collections/{coll}/articles?page_size=1000'
           r=S.get(u,timeout=60); audit['figshare']['collection_status']=r.status_code
@@ -54,7 +57,6 @@ jobs:
                   name=f.get('name','')
                   furl=f.get('download_url')
                   if not furl: continue
-                  # Download modest data/metadata files; skip huge tweet archives.
                   size=f.get('size') or 0
                   if size <= 50_000_000 or any(x in name.lower() for x in ['earn','event','announcement','ea','market']):
                       try:
@@ -68,13 +70,11 @@ jobs:
           audit['figshare']['details']=details
           audit['figshare']['downloaded']=downloaded
 
-          # Attempt legacy ID in Data Availability statement.
           for aid in [4036269]:
               rr=S.get(f'https://api.figshare.com/v2/articles/{aid}',timeout=60)
               audit['figshare'][f'legacy_{aid}_status']=rr.status_code
               if rr.ok: audit['figshare'][f'legacy_{aid}']=rr.json()
 
-          # Inspect downloaded tabular/text files for target tickers and timing strings.
           scans=[]
           for item in downloaded:
               if 'path' not in item: continue
@@ -109,7 +109,6 @@ jobs:
               scans.append(rec)
           audit['figshare']['scans']=scans
 
-          # ---- SEC submissions / 8-K Item 2.02 ----
           sec_headers={'User-Agent':'EFTM academic research contact research@example.com','Accept-Encoding':'gzip, deflate'}
           tick=S.get('https://www.sec.gov/files/company_tickers.json',headers=sec_headers,timeout=60).json()
           ticker_map={v['ticker'].upper():str(v['cik_str']).zfill(10) for v in tick.values()}
@@ -139,7 +138,6 @@ jobs:
                       if adt:
                           try:
                               dt=datetime.fromisoformat(str(adt).replace('Z','+00:00'))
-                              # SEC acceptance timestamps are retained verbatim; classification is proxy only.
                               h=dt.hour+dt.minute/60
                               cls='sec_pre_market_proxy' if h<9.5 else ('sec_after_close_proxy' if h>=16 else 'sec_intraday_proxy')
                           except Exception: pass
