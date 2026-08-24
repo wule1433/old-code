@@ -1,0 +1,71 @@
+name: EFTM v1.2 ODC Yahoo estimate audit
+
+on:
+  push:
+    branches: [eftm-strict-open-20260822]
+    paths:
+      - '.github/workflows/eftm_v12_odc_yahoo_audit.yml'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install 'huggingface_hub[hf_xet]>=0.34' pandas pyarrow
+      - name: Inspect estimate tables
+        env:
+          HF_HUB_DOWNLOAD_TIMEOUT: 1800
+          HF_HUB_ETAG_TIMEOUT: 120
+          HF_XET_HIGH_PERFORMANCE: 1
+        run: |
+          mkdir -p eftm_v12_odc_yahoo
+          python - <<'PY'
+          from huggingface_hub import HfApi, hf_hub_download
+          from pathlib import Path
+          import pandas as pd, json
+
+          repo='Joshua-Xia/yahoo-finance-data'
+          targets=['AMD','AAPL','MSFT','NVDA','AVGO']
+          out=Path('eftm_v12_odc_yahoo')
+          info=HfApi().dataset_info(repo, files_metadata=True)
+          cd=getattr(info,'card_data',None)
+          lic=cd.get('license') if isinstance(cd,dict) else getattr(cd,'license',None)
+          files={x.rfilename:getattr(x,'size',None) for x in info.siblings}
+          wanted=['data/stock_earning_estimates.parquet','data/stock_revenue_estimates.parquet','data/stock_earning_calendar.parquet','data/stock_historical_eps.parquet']
+          qa={'repo':repo,'sha':info.sha,'declared_license':lic,'files':{},'targets':targets}
+          for name in wanted:
+              p=hf_hub_download(repo,name,repo_type='dataset')
+              df=pd.read_parquet(p)
+              qa['files'][name]={'rows':int(len(df)),'columns':list(map(str,df.columns)),'head':df.head(8).astype(str).to_dict('records')}
+              symcol='symbol' if 'symbol' in df.columns else ('ticker' if 'ticker' in df.columns else None)
+              if symcol:
+                  d=df.copy(); d[symcol]=d[symcol].astype(str).str.upper(); d=d[d[symcol].isin(targets)].copy()
+                  rec={'rows':int(len(d)),'counts':d.groupby(symcol).size().to_dict(),'sample':d.head(100).astype(str).to_dict('records')}
+                  for c in ['report_date','period','quarter','date','earnings_date']:
+                      if c in d.columns:
+                          x=pd.to_datetime(d[c],errors='coerce')
+                          if x.notna().any():
+                              rec.setdefault('date_ranges',{})[c]={'min':str(x.min()),'max':str(x.max()),'unique':int(x.nunique())}
+                  # count unique report_date snapshots per ticker to distinguish current snapshot vs history
+                  if 'report_date' in d.columns:
+                      rec['unique_report_dates_by_ticker']=d.groupby(symcol)['report_date'].nunique(dropna=True).to_dict()
+                  # count periods / estimate types
+                  for c in ['period','estimate_type','period_type']:
+                      if c in d.columns:
+                          rec[c+'_values']=d[c].astype(str).value_counts(dropna=False).head(50).to_dict()
+                  qa['files'][name]['target']=rec
+          (out/'ODC_YAHOO_ESTIMATE_AUDIT.json').write_text(json.dumps(qa,indent=2,ensure_ascii=False),encoding='utf-8')
+          print(json.dumps(qa,indent=2,ensure_ascii=False)[:250000])
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: eftm-v12-odc-yahoo-estimate-audit
+          retention-days: 3
+          compression-level: 9
+          path: eftm_v12_odc_yahoo/**
