@@ -1,0 +1,84 @@
+name: EFTM v1.2 SEC-LEDGER coverage match
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - '.github/workflows/eftm_v12_sec_ledger_match.yml'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install 'huggingface_hub[hf_xet]>=0.34' pandas pyarrow requests
+      - name: Match SEC Item 2.02 to LEDGER EPS
+        run: |
+          mkdir -p eftm_v12_sec_ledger
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download, HfApi
+          import pandas as pd, requests, json, time
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          from pathlib import Path
+          out=Path('eftm_v12_sec_ledger'); targets=['AMD','AAPL','MSFT','NVDA','AVGO']
+          api=HfApi(); info=api.dataset_info('artefactory/ledger-market-sentiment')
+          lic=(getattr(info,'card_data',None) or {}).get('license') if isinstance(getattr(info,'card_data',None),dict) else getattr(getattr(info,'card_data',None),'license',None)
+          print('LEDGER license',lic); assert str(lic).lower()=='cc-by-4.0'
+          p=hf_hub_download('artefactory/ledger-market-sentiment','eps_surprise/data.parquet',repo_type='dataset')
+          led=pd.read_parquet(p); led['ticker']=led['ticker'].astype(str).str.upper(); led=led[led.ticker.isin(targets)].copy()
+          led['earnings_dt']=pd.to_datetime(led['earnings_date'],utc=True,errors='coerce'); led['date_utc']=led.earnings_dt.dt.date.astype(str)
+          # ET calendar date too, for robust matching around UTC boundaries.
+          led['date_et']=led.earnings_dt.dt.tz_convert('America/New_York').dt.date.astype(str)
+          led.to_csv(out/'ledger_target_eps.csv',index=False)
+
+          S=requests.Session(); headers={'User-Agent':'EFTM academic research contact research@example.com','Accept-Encoding':'gzip, deflate'}
+          tick=S.get('https://www.sec.gov/files/company_tickers.json',headers=headers,timeout=60).json(); tmap={v['ticker'].upper():str(v['cik_str']).zfill(10) for v in tick.values()}
+          rows=[]
+          for ticker in targets:
+              cik=tmap[ticker]; sub=S.get(f'https://data.sec.gov/submissions/CIK{cik}.json',headers=headers,timeout=60).json(); sets=[sub.get('filings',{}).get('recent',{})]
+              for fref in sub.get('filings',{}).get('files',[]):
+                  name=fref.get('name')
+                  if name:
+                      try: sets.append(S.get('https://data.sec.gov/submissions/'+name,headers=headers,timeout=60).json())
+                      except Exception: pass
+                  time.sleep(.11)
+              for fs in sets:
+                  n=max([len(v) for v in fs.values() if isinstance(v,list)] or [0])
+                  for i in range(n):
+                      def g(k):
+                          v=fs.get(k,[]); return v[i] if isinstance(v,list) and i<len(v) else None
+                      if g('form')!='8-K' or '2.02' not in str(g('items') or ''): continue
+                      adt=g('acceptanceDateTime'); cls='unknown'; et=None
+                      if adt:
+                          dt=datetime.fromisoformat(str(adt).replace('Z','+00:00')).astimezone(ZoneInfo('America/New_York')); et=dt.isoformat(); h=dt.hour+dt.minute/60
+                          cls='bmo' if h<9.5 else ('amc' if h>=16 else 'intraday')
+                      rows.append({'ticker':ticker,'filingDate':g('filingDate'),'acceptanceDateTime':adt,'acceptance_et':et,'proxy_time':cls,'accessionNumber':g('accessionNumber')})
+          sec=pd.DataFrame(rows).drop_duplicates(['ticker','accessionNumber']); sec['filingDate_dt']=pd.to_datetime(sec.filingDate)
+          matches=[]
+          for _,r in sec.iterrows():
+              q=led[led.ticker.eq(r.ticker)].copy()
+              # Match on either UTC or ET LEDGER event date within +/-2 days; choose smallest calendar distance.
+              if len(q):
+                  q['d_et']=(pd.to_datetime(q.date_et)-r.filingDate_dt).abs().dt.days
+                  q['d_utc']=(pd.to_datetime(q.date_utc)-r.filingDate_dt).abs().dt.days
+                  q['dist']=q[['d_et','d_utc']].min(axis=1); q=q[q.dist<=2].sort_values(['dist','earnings_dt'])
+              if len(q):
+                  x=q.iloc[0]; matches.append({**r.drop(labels=['filingDate_dt']).to_dict(),'ledger_match':True,'ledger_earnings_date':str(x.earnings_date),'ledger_date_et':x.date_et,'ledger_eps_estimate':x.eps_estimate,'ledger_reported_eps':x.reported_eps,'ledger_surprise_pct':x.surprise_pct,'match_distance_days':int(x.dist)})
+              else: matches.append({**r.drop(labels=['filingDate_dt']).to_dict(),'ledger_match':False})
+          m=pd.DataFrame(matches); m.to_csv(out/'sec_ledger_target_matches.csv',index=False)
+          stats={'ledger_target_counts':led.groupby('ticker').size().to_dict(),'sec_item202_counts':sec.groupby('ticker').size().to_dict(),'sec_class_counts':sec.groupby(['ticker','proxy_time']).size().unstack(fill_value=0).to_dict('index'),'matched_counts':m[m.ledger_match].groupby('ticker').size().to_dict(),'matched_by_proxy_class':m[m.ledger_match].groupby(['ticker','proxy_time']).size().unstack(fill_value=0).to_dict('index'),'match_distance_counts':m[m.ledger_match].match_distance_days.value_counts().sort_index().to_dict(),'matched_rows':m[m.ledger_match].astype(str).to_dict('records')}
+          (out/'SEC_LEDGER_MATCH_QA.json').write_text(json.dumps(stats,indent=2,ensure_ascii=False),encoding='utf-8'); print(json.dumps(stats,indent=2,ensure_ascii=False)[:200000])
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: eftm-v12-sec-ledger-match
+          retention-days: 3
+          compression-level: 9
+          path: eftm_v12_sec_ledger/**
