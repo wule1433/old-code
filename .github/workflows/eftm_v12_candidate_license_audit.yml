@@ -1,0 +1,53 @@
+name: EFTM v1.2 candidate license audit
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - '.github/workflows/eftm_v12_candidate_license_audit.yml'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install huggingface_hub requests
+      - name: Audit metadata and license files
+        run: |
+          mkdir -p eftm_v12_candidate_license
+          python - <<'PY'
+          from huggingface_hub import HfApi, hf_hub_download
+          import json, os, requests
+          from pathlib import Path
+          out=Path('eftm_v12_candidate_license')
+          repos=['siddharthmb/stocks-earnings-eps_history','siddharthmb/stocks-earnings-earnings_calendar','siddharthmb/stocks-earnings-eps_estimate','siddharthmb/stocks-ohlcv']
+          api=HfApi(); rows=[]
+          for repo in repos:
+              info=api.dataset_info(repo,files_metadata=True)
+              cd=getattr(info,'card_data',None); cd_dict=dict(cd) if cd is not None else {}
+              siblings=[x.rfilename for x in info.siblings]
+              rec={'repo':repo,'sha':info.sha,'card_data':cd_dict,'tags':info.tags,'siblings':siblings,'license_files':{},'readme':None}
+              for name in siblings:
+                  low=name.lower()
+                  if low in ['license','license.txt','license.md','copying','copying.txt','readme.md','readme.txt']:
+                      try:
+                          p=hf_hub_download(repo,name,repo_type='dataset'); txt=Path(p).read_text(errors='ignore')
+                          if 'readme' in low: rec['readme']=txt[:50000]
+                          else: rec['license_files'][name]=txt[:50000]
+                      except Exception as e: rec.setdefault('errors',[]).append(repr(e))
+              rows.append(rec)
+          (out/'CANDIDATE_LICENSE_AUDIT.json').write_text(json.dumps(rows,indent=2,ensure_ascii=False),encoding='utf-8')
+          print(json.dumps([{'repo':r['repo'],'license':r['card_data'].get('license'),'tags':r['tags'],'license_files':list(r['license_files']),'readme_head':(r['readme'] or '')[:1000]} for r in rows],indent=2,ensure_ascii=False))
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: eftm-v12-candidate-license-audit
+          retention-days: 3
+          compression-level: 9
+          path: eftm_v12_candidate_license/**
