@@ -1,0 +1,79 @@
+name: EFTM v1.2 PLOS earnings archive audit
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - '.github/workflows/eftm_v12_legacy_plos.yml'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install requests pandas openpyxl xlrd
+      - name: Download and inspect CC-BY archive
+        run: |
+          mkdir -p eftm_v12_plos
+          python - <<'PY'
+          import requests, zipfile, io, json, re, os
+          from pathlib import Path
+          import pandas as pd
+          out=Path('eftm_v12_plos')
+          meta=requests.get('https://api.figshare.com/v2/articles/4036269',timeout=60).json()
+          assert meta.get('license',{}).get('name')=='CC BY 4.0', meta.get('license')
+          f=next(x for x in meta['files'] if x['name']=='data_for_paper.zip')
+          b=requests.get(f['download_url'],timeout=120).content
+          (out/'data_for_paper.zip').write_bytes(b)
+          z=zipfile.ZipFile(io.BytesIO(b))
+          names=z.namelist()
+          z.extractall(out/'data_for_paper')
+          targets=['AMD','AAPL','MSFT','NVDA','AVGO']
+          audit={'license':meta.get('license'),'article_title':meta.get('title'),'doi':meta.get('doi'),'files':names,'scans':[]}
+          for name in names:
+              if name.endswith('/'): continue
+              p=out/'data_for_paper'/name
+              rec={'name':name,'size':p.stat().st_size,'target_hits':{},'timing_hits':{}}
+              try:
+                  ext=p.suffix.lower()
+                  dfs=[]
+                  if ext=='.csv': dfs=[('csv',pd.read_csv(p,low_memory=False))]
+                  elif ext in ['.xls','.xlsx']:
+                      xls=pd.ExcelFile(p)
+                      for sh in xls.sheet_names: dfs.append((sh,pd.read_excel(p,sheet_name=sh)))
+                  elif ext in ['.txt','.tsv','.dat']:
+                      text=p.read_text(errors='ignore')
+                      rec['text_preview']=text[:3000]
+                      for t in targets:
+                          if t in text.upper(): rec['target_hits'][t]='FOUND'
+                      for tok in ['before','after','open','close','BMO','AMC']:
+                          n=len(re.findall(tok,text,re.I))
+                          if n: rec['timing_hits'][tok]=n
+                  for sh,df in dfs:
+                      rec.setdefault('tables',[]).append({'sheet':sh,'rows':len(df),'columns':list(map(str,df.columns)),'head':df.head(10).astype(str).to_dict('records')})
+                      txt=df.astype(str)
+                      for t in targets:
+                          mask=txt.apply(lambda c:c.str.upper().eq(t)).any(axis=1)
+                          if mask.any(): rec['target_hits'].setdefault(t,[]).extend(df[mask].head(100).astype(str).to_dict('records'))
+                      for tok in ['before','after','open','close','BMO','AMC']:
+                          mask=txt.apply(lambda c:c.str.contains(tok,case=False,na=False,regex=False)).any(axis=1)
+                          if mask.any(): rec['timing_hits'][tok]=int(mask.sum())
+              except Exception as e: rec['error']=repr(e)
+              audit['scans'].append(rec)
+          (out/'PLOS_ARCHIVE_AUDIT.json').write_text(json.dumps(audit,indent=2,ensure_ascii=False),encoding='utf-8')
+          print(json.dumps({'files':names,'useful':[{'name':r['name'],'targets':list(r.get('target_hits',{})),'timing':r.get('timing_hits'),'tables':[(x['sheet'],x['rows'],x['columns']) for x in r.get('tables',[])]} for r in audit['scans'] if r.get('target_hits') or r.get('timing_hits') or r.get('tables')]},indent=2)[:200000])
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: eftm-v12-plos-earnings-audit
+          retention-days: 3
+          compression-level: 9
+          path: |
+            eftm_v12_plos/PLOS_ARCHIVE_AUDIT.json
+            eftm_v12_plos/data_for_paper/**
