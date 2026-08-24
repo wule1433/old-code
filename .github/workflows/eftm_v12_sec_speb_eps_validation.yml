@@ -1,0 +1,102 @@
+name: EFTM v1.2 SEC-speb EPS validation
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - '.github/workflows/eftm_v12_sec_speb_eps_validation.yml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      HF_HUB_DOWNLOAD_TIMEOUT: '1800'
+      HF_HUB_ETAG_TIMEOUT: '120'
+      HF_XET_HIGH_PERFORMANCE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install 'huggingface_hub[hf_xet]>=0.34' pandas pyarrow requests
+      - name: Validate SEC to speb EPS alignment
+        run: |
+          mkdir -p eftm_v12_sec_speb
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download, HfApi
+          import pandas as pd, requests, json, time, zipfile, io, numpy as np
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          from pathlib import Path
+          out=Path('eftm_v12_sec_speb'); targets=['AMD','AAPL','MSFT','NVDA','AVGO']
+
+          # license gate
+          info=HfApi().dataset_info('speb/financial-data')
+          cd=getattr(info,'card_data',None)
+          lic=cd.get('license') if isinstance(cd,dict) else getattr(cd,'license',None)
+          assert str(lic).lower()=='cc-by-4.0', lic
+          hp=hf_hub_download('speb/financial-data','raw/stock_earnings_history.parquet',repo_type='dataset')
+          hist=pd.read_parquet(hp); hist['symbol']=hist.symbol.astype(str).str.upper(); hist=hist[hist.symbol.isin(targets)].copy()
+          hist['quarter_dt']=pd.to_datetime(hist.quarter,errors='coerce'); hist['eps_actual']=pd.to_numeric(hist.eps_actual,errors='coerce'); hist['eps_estimate']=pd.to_numeric(hist.eps_estimate,errors='coerce')
+          hist=hist.dropna(subset=['quarter_dt']).sort_values(['symbol','quarter_dt']).drop_duplicates(['symbol','quarter_dt'],keep='last')
+          hist.to_csv(out/'speb_target_earnings_history.csv',index=False)
+
+          # SEC Item 2.02 target history, acceptance converted UTC->ET
+          S=requests.Session(); headers={'User-Agent':'EFTM academic research contact research@example.com','Accept-Encoding':'gzip, deflate'}
+          tick=S.get('https://www.sec.gov/files/company_tickers.json',headers=headers,timeout=60).json(); tmap={v['ticker'].upper():str(v['cik_str']).zfill(10) for v in tick.values()}
+          secrows=[]
+          for ticker in targets:
+              cik=tmap[ticker]; sub=S.get(f'https://data.sec.gov/submissions/CIK{cik}.json',headers=headers,timeout=60).json(); sets=[sub.get('filings',{}).get('recent',{})]
+              for fref in sub.get('filings',{}).get('files',[]):
+                  name=fref.get('name')
+                  if name:
+                      try: sets.append(S.get('https://data.sec.gov/submissions/'+name,headers=headers,timeout=60).json())
+                      except Exception: pass
+                  time.sleep(.11)
+              for fs in sets:
+                  n=max([len(v) for v in fs.values() if isinstance(v,list)] or [0])
+                  for i in range(n):
+                      def g(k):
+                          v=fs.get(k,[]); return v[i] if isinstance(v,list) and i<len(v) else None
+                      if g('form')!='8-K' or '2.02' not in str(g('items') or ''): continue
+                      adt=g('acceptanceDateTime'); et=None; cls='unknown'
+                      if adt:
+                          dt=datetime.fromisoformat(str(adt).replace('Z','+00:00')).astimezone(ZoneInfo('America/New_York')); et=dt.isoformat(); h=dt.hour+dt.minute/60
+                          cls='bmo' if h<9.5 else ('amc' if h>=16 else 'intraday')
+                      secrows.append({'symbol':ticker,'event_date':g('filingDate'),'acceptance_utc':adt,'acceptance_et':et,'proxy_time':cls,'accessionNumber':g('accessionNumber')})
+          sec=pd.DataFrame(secrows).drop_duplicates(['symbol','accessionNumber']); sec['event_dt']=pd.to_datetime(sec.event_date,errors='coerce')
+
+          # Map each SEC earnings event to latest fiscal quarter end in speb between 10 and 150 days before event.
+          mapped=[]
+          for _,r in sec.iterrows():
+              q=hist[hist.symbol.eq(r.symbol)].copy(); q['lag_days']=(r.event_dt-q.quarter_dt).dt.days; q=q[(q.lag_days>=10)&(q.lag_days<=150)].sort_values(['lag_days','quarter_dt'])
+              if len(q):
+                  x=q.iloc[0]; mapped.append({**r.drop(labels=['event_dt']).to_dict(),'quarter':x.quarter_dt.date().isoformat(),'quarter_lag_days':int(x.lag_days),'eps_actual':x.eps_actual,'eps_estimate':x.eps_estimate,'eps_difference':x.get('eps_difference'),'surprise_percent':x.get('surprise_percent'),'speb_match':True})
+              else: mapped.append({**r.drop(labels=['event_dt']).to_dict(),'speb_match':False})
+          m=pd.DataFrame(mapped); m.to_csv(out/'sec_speb_eps_target_matches.csv',index=False)
+
+          # PLOS CC-BY MSFT 12-event truth table; PLOS date is next response date for AfterClose, SEC date is actual event date.
+          pm=requests.get('https://api.figshare.com/v2/articles/4036269',timeout=60).json(); assert pm.get('license',{}).get('name')=='CC BY 4.0'
+          pf=next(x for x in pm['files'] if x['name']=='data_for_paper.zip'); zb=requests.get(pf['download_url'],timeout=120).content; z=zipfile.ZipFile(io.BytesIO(zb)); pl=pd.read_csv(z.open('EA_data.csv')); pl=pl[pl.Company.eq('MSFT')].copy(); pl['Date']=pd.to_datetime(pl.Date)
+          val=[]
+          for _,r in pl.iterrows():
+              # For PLOS AfterClose MSFT, SEC event is one calendar day prior; robustly search 0-4 days prior and select closest.
+              mm=m[(m.symbol.eq('MSFT'))&(m.speb_match.eq(True))].copy(); mm['sec_dt']=pd.to_datetime(mm.event_date); mm['dist']=(r.Date-mm.sec_dt).dt.days; mm=mm[(mm.dist>=0)&(mm.dist<=4)].sort_values(['dist','sec_dt'])
+              if len(mm):
+                  x=mm.iloc[0]; act_diff=abs(float(x.eps_actual)-float(r.Reported)) if pd.notna(x.eps_actual) else None; est_diff=abs(float(x.eps_estimate)-float(r.Estimated)) if pd.notna(x.eps_estimate) else None
+                  val.append({'plos_date':r.Date.date().isoformat(),'plos_timing':r.Timing,'plos_reported':r.Reported,'plos_estimated':r.Estimated,'sec_event_date':x.event_date,'quarter':x.quarter,'quarter_lag_days':x.quarter_lag_days,'speb_actual':x.eps_actual,'speb_estimate':x.eps_estimate,'actual_abs_diff':act_diff,'estimate_abs_diff':est_diff,'actual_agree_0p02':act_diff is not None and act_diff<=0.02,'estimate_agree_0p02':est_diff is not None and est_diff<=0.02})
+              else: val.append({'plos_date':r.Date.date().isoformat(),'matched':False})
+          v=pd.DataFrame(val); v.to_csv(out/'plos_msft_sec_speb_validation.csv',index=False)
+          mm=m[m.speb_match.eq(True)].copy()
+          qa={'speb_license':str(lic),'speb_history_counts':hist.groupby('symbol').size().to_dict(),'speb_history_ranges':hist.groupby('symbol').quarter_dt.agg(['min','max']).astype(str).to_dict('index'),'sec_counts':sec.groupby('symbol').size().to_dict(),'mapped_counts':mm.groupby('symbol').size().to_dict(),'mapped_proxy_counts':mm.groupby(['symbol','proxy_time']).size().unstack(fill_value=0).to_dict('index') if len(mm) else {},'quarter_lag_summary':mm.groupby('symbol').quarter_lag_days.agg(['count','min','median','max']).to_dict('index') if len(mm) else {},'plos_msft_validation_n':int(len(v)),'plos_msft_actual_agreement_0p02':float(v.actual_agree_0p02.mean()) if 'actual_agree_0p02' in v else None,'plos_msft_estimate_agreement_0p02':float(v.estimate_agree_0p02.mean()) if 'estimate_agree_0p02' in v else None,'plos_msft_rows':v.astype(str).to_dict('records')}
+          (out/'SEC_SPEB_EPS_VALIDATION_QA.json').write_text(json.dumps(qa,indent=2,ensure_ascii=False),encoding='utf-8'); print(json.dumps(qa,indent=2,ensure_ascii=False)[:200000])
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: eftm-v12-sec-speb-eps-validation
+          retention-days: 3
+          compression-level: 9
+          path: eftm_v12_sec_speb/**
