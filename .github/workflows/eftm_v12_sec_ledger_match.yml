@@ -27,16 +27,13 @@ jobs:
           from zoneinfo import ZoneInfo
           from pathlib import Path
           out=Path('eftm_v12_sec_ledger'); targets=['AMD','AAPL','MSFT','NVDA','AVGO']
-          api=HfApi(); info=api.dataset_info('artefactory/ledger-market-sentiment')
+          info=HfApi().dataset_info('artefactory/ledger-market-sentiment')
           lic=(getattr(info,'card_data',None) or {}).get('license') if isinstance(getattr(info,'card_data',None),dict) else getattr(getattr(info,'card_data',None),'license',None)
-          print('LEDGER license',lic); assert str(lic).lower()=='cc-by-4.0'
+          assert str(lic).lower()=='cc-by-4.0', lic
           p=hf_hub_download('artefactory/ledger-market-sentiment','eps_surprise/data.parquet',repo_type='dataset')
           led=pd.read_parquet(p); led['ticker']=led['ticker'].astype(str).str.upper(); led=led[led.ticker.isin(targets)].copy()
-          led['earnings_dt']=pd.to_datetime(led['earnings_date'],utc=True,errors='coerce'); led['date_utc']=led.earnings_dt.dt.date.astype(str)
-          # ET calendar date too, for robust matching around UTC boundaries.
-          led['date_et']=led.earnings_dt.dt.tz_convert('America/New_York').dt.date.astype(str)
+          led['earnings_dt']=pd.to_datetime(led['earnings_date'],utc=True,errors='coerce'); led['date_utc']=led.earnings_dt.dt.date.astype(str); led['date_et']=led.earnings_dt.dt.tz_convert('America/New_York').dt.date.astype(str)
           led.to_csv(out/'ledger_target_eps.csv',index=False)
-
           S=requests.Session(); headers={'User-Agent':'EFTM academic research contact research@example.com','Accept-Encoding':'gzip, deflate'}
           tick=S.get('https://www.sec.gov/files/company_tickers.json',headers=headers,timeout=60).json(); tmap={v['ticker'].upper():str(v['cik_str']).zfill(10) for v in tick.values()}
           rows=[]
@@ -63,16 +60,13 @@ jobs:
           matches=[]
           for _,r in sec.iterrows():
               q=led[led.ticker.eq(r.ticker)].copy()
-              # Match on either UTC or ET LEDGER event date within +/-2 days; choose smallest calendar distance.
               if len(q):
-                  q['d_et']=(pd.to_datetime(q.date_et)-r.filingDate_dt).abs().dt.days
-                  q['d_utc']=(pd.to_datetime(q.date_utc)-r.filingDate_dt).abs().dt.days
-                  q['dist']=q[['d_et','d_utc']].min(axis=1); q=q[q.dist<=2].sort_values(['dist','earnings_dt'])
+                  q['d_et']=(pd.to_datetime(q.date_et)-r.filingDate_dt).abs().dt.days; q['d_utc']=(pd.to_datetime(q.date_utc)-r.filingDate_dt).abs().dt.days; q['dist']=q[['d_et','d_utc']].min(axis=1); q=q[q.dist<=2].sort_values(['dist','earnings_dt'])
               if len(q):
                   x=q.iloc[0]; matches.append({**r.drop(labels=['filingDate_dt']).to_dict(),'ledger_match':True,'ledger_earnings_date':str(x.earnings_date),'ledger_date_et':x.date_et,'ledger_eps_estimate':x.eps_estimate,'ledger_reported_eps':x.reported_eps,'ledger_surprise_pct':x.surprise_pct,'match_distance_days':int(x.dist)})
               else: matches.append({**r.drop(labels=['filingDate_dt']).to_dict(),'ledger_match':False})
-          m=pd.DataFrame(matches); m.to_csv(out/'sec_ledger_target_matches.csv',index=False)
-          stats={'ledger_target_counts':led.groupby('ticker').size().to_dict(),'sec_item202_counts':sec.groupby('ticker').size().to_dict(),'sec_class_counts':sec.groupby(['ticker','proxy_time']).size().unstack(fill_value=0).to_dict('index'),'matched_counts':m[m.ledger_match].groupby('ticker').size().to_dict(),'matched_by_proxy_class':m[m.ledger_match].groupby(['ticker','proxy_time']).size().unstack(fill_value=0).to_dict('index'),'match_distance_counts':m[m.ledger_match].match_distance_days.value_counts().sort_index().to_dict(),'matched_rows':m[m.ledger_match].astype(str).to_dict('records')}
+          m=pd.DataFrame(matches); m.to_csv(out/'sec_ledger_target_matches.csv',index=False); mm=m[m.ledger_match.eq(True)].copy()
+          stats={'ledger_target_counts':led.groupby('ticker').size().to_dict(),'ledger_target_total':int(len(led)),'sec_item202_counts':sec.groupby('ticker').size().to_dict(),'sec_class_counts':sec.groupby(['ticker','proxy_time']).size().unstack(fill_value=0).to_dict('index'),'matched_counts':mm.groupby('ticker').size().to_dict() if len(mm) else {},'matched_by_proxy_class':mm.groupby(['ticker','proxy_time']).size().unstack(fill_value=0).to_dict('index') if len(mm) else {},'match_distance_counts':mm['match_distance_days'].value_counts().sort_index().to_dict() if len(mm) and 'match_distance_days' in mm else {},'matched_rows':mm.astype(str).to_dict('records') if len(mm) else []}
           (out/'SEC_LEDGER_MATCH_QA.json').write_text(json.dumps(stats,indent=2,ensure_ascii=False),encoding='utf-8'); print(json.dumps(stats,indent=2,ensure_ascii=False)[:200000])
           PY
       - name: Upload
