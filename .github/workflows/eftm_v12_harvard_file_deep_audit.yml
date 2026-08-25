@@ -1,0 +1,111 @@
+name: EFTM v1.2 Harvard file deep audit
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full && pip install requests pandas pyreadstat openpyxl
+      - name: Inspect selected replication files
+        run: |
+          mkdir -p eftm_v12_harvard_deep
+          python - <<'PY'
+          import requests, json, os, re, zipfile, io, subprocess, tempfile, shutil
+          import pandas as pd
+          from pathlib import Path
+          out=Path('eftm_v12_harvard_deep'); S=requests.Session(); S.headers['User-Agent']='Mozilla/5.0 EFTM-research-audit'
+          files={
+           11618057:'P8EPFE_Banco_de_dados_inicial.xlsx',
+           10692727:'QYFM2U_Forecast_Dispersion_Main.dta',
+           10692728:'QYFM2U_Forecast_Accuracy_Main.dta',
+           6841899:'B3ZHLZ_Replication_kit_final.7z',
+           14122922:'FQPCNJ_package_JFQA.zip',
+           7452242:'IODRCA_README.md',
+           7452273:'IODRCA_datacollection.sas',
+           7452241:'IODRCA_organize_forecasts.py',
+          }
+          audit={}
+          for fid,name in files.items():
+            rec={'file_id':fid,'name':name}; url=f'https://dataverse.harvard.edu/api/access/datafile/{fid}'
+            try:
+              r=S.get(url,timeout=300); rec['status']=r.status_code; rec['content_type']=r.headers.get('content-type'); rec['bytes']=len(r.content)
+              if not r.ok: rec['text']=r.text[:2000]; audit[str(fid)]=rec; continue
+              b=r.content; low=name.lower()
+              if low.endswith('.xlsx'):
+                xls=pd.ExcelFile(io.BytesIO(b)); rec['sheets']=xls.sheet_names
+                sh={}
+                for sn in xls.sheet_names[:20]:
+                  df=pd.read_excel(io.BytesIO(b),sheet_name=sn,nrows=2000)
+                  sh[sn]={'shape_sample':list(df.shape),'columns':[str(c) for c in df.columns], 'head':df.head(5).astype(str).to_dict('records')}
+                rec['sheet_audit']=sh
+              elif low.endswith('.dta'):
+                p=out/name; p.write_bytes(b)
+                # iterator to avoid materializing huge file
+                it=pd.read_stata(p,iterator=True)
+                rec['varlist']=[str(x) for x in it.variable_labels().keys()]
+                rec['varlabels']=it.variable_labels()
+                try:
+                  df=it.read(10000); rec['sample_rows']=len(df); rec['sample_head']=df.head(5).astype(str).to_dict('records')
+                  targets=['AAPL','AMD','AVGO','MSFT','NVDA']
+                  counts={}
+                  for c in df.columns:
+                    if df[c].dtype=='object' or str(df[c].dtype).startswith('string'):
+                      s=df[c].astype(str).str.upper()
+                      cc={t:int((s==t).sum()) for t in targets}
+                      if any(cc.values()): counts[str(c)]=cc
+                  rec['target_counts_first10k']=counts
+                except Exception as e: rec['sample_error']=repr(e)
+                p.unlink(missing_ok=True)
+              elif low.endswith('.zip'):
+                z=zipfile.ZipFile(io.BytesIO(b)); rec['archive_files']=[{'name':x.filename,'size':x.file_size} for x in z.infolist()]
+                hits=[]
+                for x in z.infolist():
+                  if x.file_size>10_000_000: continue
+                  if x.filename.lower().endswith(('.txt','.md','.do','.sas','.py','.r','.csv')):
+                    try:
+                      txt=z.read(x).decode('utf-8','ignore')
+                      if re.search(r'ibes|i/b/e/s|analyst|forecast|consensus|earnings|eps|ticker|permno|cusip',txt,re.I): hits.append({'name':x.filename,'head':txt[:20000]})
+                    except: pass
+                rec['text_hits']=hits[:100]
+              elif low.endswith('.7z'):
+                with tempfile.TemporaryDirectory() as td:
+                  arc=Path(td)/'a.7z'; arc.write_bytes(b)
+                  q=subprocess.run(['7z','l','-slt',str(arc)],capture_output=True,text=True,timeout=60)
+                  rec['listing']=q.stdout[:100000]
+                  ext=Path(td)/'ext'; ext.mkdir(); subprocess.run(['7z','x','-y',f'-o{ext}',str(arc)],capture_output=True,text=True,timeout=120)
+                  hits=[]
+                  for p in ext.rglob('*'):
+                    if p.is_file() and p.stat().st_size<10_000_000 and p.suffix.lower() in ['.txt','.md','.do','.sas','.py','.r','.csv']:
+                      txt=p.read_text(errors='ignore')
+                      if re.search(r'ibes|i/b/e/s|analyst|forecast|consensus|earnings|eps|ticker|permno|cusip',txt,re.I): hits.append({'name':str(p.relative_to(ext)),'head':txt[:20000]})
+                  rec['text_hits']=hits[:100]
+              else:
+                txt=b.decode('utf-8','ignore'); rec['text']=txt[:50000]
+            except Exception as e: rec['error']=repr(e)
+            audit[str(fid)]=rec
+          (out/'HARVARD_FILE_DEEP_AUDIT.json').write_text(json.dumps(audit,indent=2,ensure_ascii=False),encoding='utf-8')
+          for k,r in audit.items():
+            print('\n###',k,r.get('name'),'status',r.get('status'),'bytes',r.get('bytes'))
+            if r.get('varlist'): print('VARS',r['varlist'][:300]); print('TARGETS',r.get('target_counts_first10k'))
+            if r.get('sheets'): print('SHEETS',r['sheets']); print('COLS',{s:v['columns'] for s,v in r.get('sheet_audit',{}).items()})
+            if r.get('archive_files'): print('ARCHIVE',r['archive_files'][:200])
+            if r.get('listing'): print('7Z',r['listing'][:30000])
+            if r.get('text_hits'): print('HITS',[x['name'] for x in r['text_hits']])
+            if r.get('text'): print('TEXT',r['text'][:12000])
+          PY
+      - name: Upload audit only
+        uses: actions/upload-artifact@v4
+        with:
+          name: eftm-v12-harvard-file-deep-audit
+          retention-days: 3
+          compression-level: 9
+          path: eftm_v12_harvard_deep/**
