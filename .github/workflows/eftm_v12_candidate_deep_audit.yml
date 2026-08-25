@@ -1,0 +1,162 @@
+name: EFTM v1.2 deep candidate audit
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install 'huggingface_hub[hf_xet]>=0.34' pandas pyarrow requests openpyxl
+      - name: Deep audit candidate datasets
+        env:
+          HF_HUB_DOWNLOAD_TIMEOUT: 1800
+          HF_HUB_ETAG_TIMEOUT: 120
+          HF_XET_HIGH_PERFORMANCE: 1
+        run: |
+          mkdir -p eftm_v12_candidate_deep
+          python - <<'PY'
+          from huggingface_hub import HfApi, hf_hub_download
+          from pathlib import Path
+          import pandas as pd, requests, json, io, zipfile, re
+
+          out=Path('eftm_v12_candidate_deep')
+          targets=['AMD','AAPL','MSFT','NVDA','AVGO']
+          api=HfApi()
+          repos=[
+            'sovai/earnings_surprise',
+            'jwigginton/earnings-sp500',
+            'jwigginton/earnings-surprise-sp500',
+            'jwigginton/earnings-forecast-sp500',
+            'jwigginton/revenue-estimate-sp500',
+          ]
+          audit={'targets':targets,'huggingface':{},'figshare':{},'zenodo':{}}
+
+          for repo in repos:
+            try:
+              info=api.dataset_info(repo,files_metadata=True)
+              cd=getattr(info,'card_data',None)
+              lic=cd.get('license') if isinstance(cd,dict) else getattr(cd,'license',None)
+              rec={'sha':info.sha,'license':lic,'tags':getattr(info,'tags',None),'files':[x.rfilename for x in info.siblings]}
+              readme=None
+              if 'README.md' in rec['files']:
+                try:
+                  rp=hf_hub_download(repo,'README.md',repo_type='dataset')
+                  readme=Path(rp).read_text(errors='ignore')
+                except Exception as e: rec['readme_error']=repr(e)
+              rec['readme']=readme[:20000] if readme else None
+              # Download all small parquet/csv files under 25 MB, enough for these candidates.
+              tables=[]
+              for sib in info.siblings:
+                name=sib.rfilename
+                size=getattr(sib,'size',None) or 0
+                if not (name.endswith('.parquet') or name.endswith('.csv')): continue
+                if size and size>25_000_000: continue
+                try:
+                  p=hf_hub_download(repo,name,repo_type='dataset')
+                  if name.endswith('.parquet'): df=pd.read_parquet(p)
+                  else: df=pd.read_csv(p,low_memory=False)
+                except Exception as e:
+                  tables.append({'file':name,'error':repr(e)}); continue
+                tr={'file':name,'rows':int(len(df)),'columns':list(map(str,df.columns))}
+                symcol=next((c for c in ['ticker','symbol','Company'] if c in df.columns),None)
+                if symcol:
+                  d=df.copy(); d[symcol]=d[symcol].astype(str).str.upper(); d=d[d[symcol].isin(targets)].copy()
+                  tr['target_rows']=int(len(d)); tr['target_counts']=d.groupby(symcol).size().to_dict()
+                  # identify event / snapshot semantics
+                  for c in ['date','date_pub','date_reported','reported_date','earnings_date','report_date','fiscal_end','fiscal_qtr_end']:
+                    if c in d.columns:
+                      x=pd.to_datetime(d[c],errors='coerce',utc=True)
+                      if x.notna().any():
+                        tr.setdefault('date_ranges',{})[c]={'min':str(x.min()),'max':str(x.max()),'unique':int(x.nunique())}
+                  # distinct likely events per target
+                  event_col=next((c for c in ['date_pub','date_reported','reported_date','earnings_date'] if c in d.columns),None)
+                  if event_col:
+                    tr['unique_events_by_target']=d.groupby(symcol)[event_col].nunique(dropna=True).to_dict()
+                  snap_col='date' if 'date' in d.columns else ('report_date' if 'report_date' in d.columns else None)
+                  if snap_col:
+                    tr['unique_snapshots_by_target']=d.groupby(symcol)[snap_col].nunique(dropna=True).to_dict()
+                  tr['target_sample']=d.head(40).astype(str).to_dict('records')
+                tables.append(tr)
+              rec['tables']=tables
+              audit['huggingface'][repo]=rec
+            except Exception as e:
+              audit['huggingface'][repo]={'error':repr(e)}
+
+          # Figshare records discovered from PLOS earnings-surprise paper and prior known record.
+          fig_ids=[4036269,24896198,24896207,24896222,24896192]
+          S=requests.Session()
+          for aid in fig_ids:
+            try:
+              r=S.get(f'https://api.figshare.com/v2/articles/{aid}',timeout=60); r.raise_for_status(); m=r.json()
+              rec={k:m.get(k) for k in ['id','title','doi','published_date','modified_date','description','license']}
+              rec['files']=m.get('files',[])
+              scans=[]
+              for f in m.get('files',[]):
+                size=f.get('size') or 0; url=f.get('download_url'); name=f.get('name','')
+                if not url or size>20_000_000: continue
+                try:
+                  b=S.get(url,timeout=120).content
+                  sr={'name':name,'size':len(b)}
+                  low=name.lower()
+                  dfs=[]
+                  if low.endswith('.csv'):
+                    dfs=[('csv',pd.read_csv(io.BytesIO(b),low_memory=False))]
+                  elif low.endswith('.xlsx'):
+                    xls=pd.ExcelFile(io.BytesIO(b)); dfs=[(sh,pd.read_excel(io.BytesIO(b),sheet_name=sh)) for sh in xls.sheet_names]
+                  elif low.endswith('.zip'):
+                    z=zipfile.ZipFile(io.BytesIO(b))
+                    for zn in z.namelist():
+                      if zn.lower().endswith('.csv'):
+                        try: dfs.append((zn,pd.read_csv(z.open(zn),low_memory=False)))
+                        except Exception: pass
+                  for sh,df in dfs:
+                    t={'sheet':sh,'rows':int(len(df)),'columns':list(map(str,df.columns))}
+                    txt=' '.join(map(str,df.columns)).lower()
+                    t['consensus_like']=any(k in txt for k in ['estimate','expected','forecast','consensus','reported','eps','surprise'])
+                    symcol=next((c for c in ['ticker','symbol','Company','company'] if c in df.columns),None)
+                    if symcol:
+                      dd=df.copy(); dd[symcol]=dd[symcol].astype(str).str.upper(); dd=dd[dd[symcol].isin(targets)]
+                      t['target_counts']=dd.groupby(symcol).size().to_dict(); t['sample']=dd.head(20).astype(str).to_dict('records')
+                    sr.setdefault('tables',[]).append(t)
+                  scans.append(sr)
+                except Exception as e: scans.append({'name':name,'error':repr(e)})
+              rec['scans']=scans; audit['figshare'][str(aid)]=rec
+            except Exception as e: audit['figshare'][str(aid)]={'error':repr(e)}
+
+          # Zenodo API search: metadata-only discovery, no license assumptions.
+          queries=['"earnings surprise"','"analyst forecast" earnings','"consensus EPS"','"earnings announcement" analyst']
+          for q in queries:
+            try:
+              r=S.get('https://zenodo.org/api/records',params={'q':q,'size':50,'sort':'bestmatch'},timeout=60); r.raise_for_status(); js=r.json()
+              hits=[]
+              for h in js.get('hits',{}).get('hits',[]):
+                md=h.get('metadata',{})
+                hits.append({'id':h.get('id'),'title':md.get('title'),'publication_date':md.get('publication_date'),'resource_type':md.get('resource_type'),'license':md.get('license'),'keywords':md.get('keywords'),'files':[{'key':f.get('key'),'size':f.get('size')} for f in h.get('files',[])]})
+              audit['zenodo'][q]=hits
+            except Exception as e: audit['zenodo'][q]={'error':repr(e)}
+
+          (out/'CANDIDATE_DEEP_AUDIT.json').write_text(json.dumps(audit,indent=2,ensure_ascii=False),encoding='utf-8')
+          # compact stdout summary
+          summary={'hf':{},'figshare':{},'zenodo_counts':{}}
+          for repo,r in audit['huggingface'].items():
+            summary['hf'][repo]={'license':r.get('license'),'tables':[{'file':t.get('file'),'rows':t.get('rows'),'target_counts':t.get('target_counts'),'unique_events':t.get('unique_events_by_target'),'date_ranges':t.get('date_ranges')} for t in r.get('tables',[])]}
+          for aid,r in audit['figshare'].items():
+            summary['figshare'][aid]={'title':r.get('title'),'license':r.get('license'),'files':[{'name':s.get('name'),'tables':s.get('tables')} for s in r.get('scans',[])]}
+          summary['zenodo_counts']={q:(len(v) if isinstance(v,list) else 0) for q,v in audit['zenodo'].items()}
+          print(json.dumps(summary,indent=2,ensure_ascii=False)[:250000])
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: eftm-v12-candidate-deep-audit
+          retention-days: 3
+          compression-level: 9
+          path: eftm_v12_candidate_deep/**
