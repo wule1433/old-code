@@ -1,0 +1,123 @@
+name: EFTM v1.2 Mendeley replication audit
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install requests pandas pyarrow openpyxl xlrd
+      - name: Audit packages
+        run: |
+          mkdir -p eftm_v12_mendeley_audit
+          python - <<'PY'
+          import requests, json, re, zipfile, io, os
+          from pathlib import Path
+          out=Path('eftm_v12_mendeley_audit')
+          S=requests.Session(); S.headers['User-Agent']='Mozilla/5.0 EFTM-research-audit'
+          candidates={
+            '2pg764w6gs':1,
+            'zg2268xzwv':2,
+            '925crksynw':2,
+          }
+          audit={}
+          for dsid,ver in candidates.items():
+            rec={'dataset_id':dsid,'version':ver}
+            urls=[
+              f'https://api.data.mendeley.com/datasets/{dsid}?version={ver}',
+              f'https://api.data.mendeley.com/datasets/publics/{dsid}?version={ver}',
+              f'https://api.data.mendeley.com/datasets/{dsid}/files?version={ver}',
+              f'https://api.data.mendeley.com/datasets/publics/{dsid}/files?version={ver}',
+            ]
+            for u in urls:
+              try:
+                r=S.get(u,timeout=60,allow_redirects=True)
+                item={'url':u,'status':r.status_code,'content_type':r.headers.get('content-type'),'text_head':r.text[:4000] if 'json' not in r.headers.get('content-type','') else None}
+                try: item['json']=r.json()
+                except Exception: pass
+                rec.setdefault('api_attempts',[]).append(item)
+              except Exception as e: rec.setdefault('api_attempts',[]).append({'url':u,'error':repr(e)})
+            # dataset webpage for embedded metadata
+            try:
+              u=f'https://data.mendeley.com/datasets/{dsid}/{ver}'
+              r=S.get(u,timeout=60); rec['page_status']=r.status_code; rec['page_head']=r.text[:50000]
+            except Exception as e: rec['page_error']=repr(e)
+            # collect any file records from successful JSON responses
+            files=[]
+            for a in rec.get('api_attempts',[]):
+              j=a.get('json')
+              if isinstance(j,list):
+                for x in j:
+                  if isinstance(x,dict) and ('filename' in x or 'content_details' in x): files.append(x)
+              elif isinstance(j,dict):
+                for k in ('files','results'):
+                  v=j.get(k)
+                  if isinstance(v,list):
+                    for x in v:
+                      if isinstance(x,dict) and ('filename' in x or 'content_details' in x): files.append(x)
+            # dedupe
+            seen=set(); uniq=[]
+            for f in files:
+              key=f.get('id') or f.get('filename') or repr(f)
+              if key in seen: continue
+              seen.add(key); uniq.append(f)
+            rec['files_detected']=uniq
+            # Download only reasonably small files (<150MB) to inspect names/archives, never upload source data.
+            scans=[]
+            for f in uniq:
+              cd=f.get('content_details') or {}
+              fn=f.get('filename') or 'unknown'
+              size=f.get('size') or cd.get('size') or 0
+              dl=cd.get('download_url')
+              sr={'filename':fn,'size':size,'has_download_url':bool(dl),'description':f.get('description')}
+              if dl and size and size <= 150_000_000:
+                try:
+                  rr=S.get(dl,timeout=180); sr['download_status']=rr.status_code; b=rr.content
+                  if rr.ok:
+                    low=fn.lower()
+                    if low.endswith('.zip'):
+                      z=zipfile.ZipFile(io.BytesIO(b)); names=z.namelist(); sr['archive_files']=names[:5000]
+                      # Inspect text-ish files and CSV headers only.
+                      text_hits=[]
+                      for zn in names:
+                        zl=zn.lower()
+                        if zl.endswith(('.txt','.md','.do','.sas','.py','.r','.m','.csv')) and z.getinfo(zn).file_size < 5_000_000:
+                          try:
+                            raw=z.read(zn)
+                            txt=raw.decode('utf-8','ignore')
+                            hit=bool(re.search(r'ibes|i/b/e/s|analyst|consensus|forecast|actual\s*eps|eps_actual|eps_est|surprise',txt,re.I))
+                            if hit: text_hits.append({'path':zn,'head':txt[:12000]})
+                          except Exception: pass
+                      sr['text_hits']=text_hits[:100]
+                    elif low.endswith(('.txt','.md','.do','.sas','.py','.r','.m','.csv')):
+                      txt=b.decode('utf-8','ignore'); sr['text_head']=txt[:20000]
+                except Exception as e: sr['download_error']=repr(e)
+              scans.append(sr)
+            rec['scans']=scans
+            audit[dsid]=rec
+          (out/'MENDELEY_REPLICATION_AUDIT.json').write_text(json.dumps(audit,indent=2,ensure_ascii=False),encoding='utf-8')
+          # compact summary
+          summary={}
+          for k,r in audit.items():
+            summary[k]={
+              'api_statuses':[x.get('status') for x in r.get('api_attempts',[])],
+              'files':[{'filename':f.get('filename'),'size':f.get('size') or (f.get('content_details') or {}).get('size')} for f in r.get('files_detected',[])],
+              'scans':[{'filename':s.get('filename'),'size':s.get('size'),'archive_files':s.get('archive_files'),'text_hit_paths':[h.get('path') for h in s.get('text_hits',[])]} for s in r.get('scans',[])]
+            }
+          print(json.dumps(summary,indent=2,ensure_ascii=False)[:250000])
+          PY
+      - name: Upload audit only
+        uses: actions/upload-artifact@v4
+        with:
+          name: eftm-v12-mendeley-replication-audit
+          retention-days: 3
+          compression-level: 9
+          path: eftm_v12_mendeley_audit/**
