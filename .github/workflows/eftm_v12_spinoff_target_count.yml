@@ -1,0 +1,49 @@
+name: EFTM v1.2 spinoff target count
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests pandas pyreadstat
+      - name: Count target events
+        run: |
+          mkdir -p eftm_v12_spinoff_count
+          python - <<'PY'
+          import requests,pandas as pd,json
+          from pathlib import Path
+          u='https://dataverse.harvard.edu/api/access/datafile/10692728'
+          r=requests.get(u,timeout=300,headers={'User-Agent':'EFTM-research-audit'}); r.raise_for_status()
+          p=Path('/tmp/q.dta');p.write_bytes(r.content)
+          cols=['ticker_peer','ACTDATS','ESTIMATOR','ANALYS','VALUE','FPEDATS','REVDATS','ANNDATS','ACTUAL','ACTDATS_ACT','ANNDATS_ACT']
+          df=pd.read_stata(p,columns=cols,convert_categoricals=False)
+          targets=['AAPL','AMD','AVGO','MSFT','NVDA']; out={}
+          for t in targets:
+            d=df[df.ticker_peer.astype(str).str.upper().str.strip()==t].copy()
+            if d.empty: out[t]={'rows':0,'unique_fpedats':0}; continue
+            d['FPEDATS_s']=pd.to_datetime(d.FPEDATS,errors='coerce')
+            d['ANNDATS_s']=pd.to_datetime(d.ANNDATS,errors='coerce')
+            d['ACTDATS_s']=pd.to_datetime(d.ACTDATS,errors='coerce')
+            d['ANNDATS_ACT_s']=pd.to_datetime(d.ANNDATS_ACT,errors='coerce')
+            by=[]
+            for f,g in d.groupby('FPEDATS_s'):
+              if pd.isna(f): continue
+              before=(g['ANNDATS_s']<g['ANNDATS_ACT_s']).sum()
+              by.append({'FPEDATS':str(f.date()),'rows':len(g),'analysts':int(g.ANALYS.nunique(dropna=True)),'forecast_date_min':str(g.ANNDATS_s.min()),'forecast_date_max':str(g.ANNDATS_s.max()),'actual_announce_min':str(g.ANNDATS_ACT_s.min()),'value_mean':float(pd.to_numeric(g.VALUE,errors='coerce').mean()),'value_median':float(pd.to_numeric(g.VALUE,errors='coerce').median()),'actual_values':[float(x) for x in pd.to_numeric(g.ACTUAL,errors='coerce').dropna().unique()[:10]],'forecasts_strictly_before_actual_n':int(before)})
+            out[t]={'rows':int(len(d)),'unique_fpedats':int(d.FPEDATS_s.nunique()),'range':[str(d.FPEDATS_s.min().date()),str(d.FPEDATS_s.max().date())],'events':by}
+          Path('eftm_v12_spinoff_count/SPINOFF_TARGET_COUNT.json').write_text(json.dumps(out,indent=2),encoding='utf-8')
+          print(json.dumps({t:{k:v for k,v in x.items() if k!='events'} for t,x in out.items()},indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eftm-v12-spinoff-target-count
+          retention-days: 3
+          path: eftm_v12_spinoff_count/**
