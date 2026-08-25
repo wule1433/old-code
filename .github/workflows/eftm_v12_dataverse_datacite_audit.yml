@@ -1,0 +1,125 @@
+name: EFTM v1.2 Dataverse DataCite audit
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install requests pandas pyarrow openpyxl xlrd
+      - name: Audit repositories
+        run: |
+          mkdir -p eftm_v12_dataverse_datacite
+          python - <<'PY'
+          import requests,json,re,urllib.parse,os,io,zipfile
+          from pathlib import Path
+          out=Path('eftm_v12_dataverse_datacite')
+          S=requests.Session(); S.headers['User-Agent']='Mozilla/5.0 EFTM-research-audit'
+          terms=['IBES','I/B/E/S','earnings surprise','analyst forecast','analyst consensus','earnings consensus','EPS forecast','EPS estimate','revenue forecast','sales forecast']
+          audit={'datacite':{},'harvard_dataverse':{},'osf_probe':{},'candidates':[]}
+
+          # DataCite discovery across repositories; collect dataset/software records only.
+          for q in terms:
+            try:
+              r=S.get('https://api.datacite.org/dois',params={'query':q,'page[size]':100},timeout=90); r.raise_for_status(); js=r.json()
+              rows=[]
+              for x in js.get('data',[]):
+                a=x.get('attributes',{})
+                rt=(a.get('types') or {}).get('resourceTypeGeneral')
+                if rt not in ('Dataset','Software','Collection'): continue
+                titles=[t.get('title','') for t in a.get('titles',[]) if isinstance(t,dict)]
+                desc=' '.join(d.get('description','') for d in a.get('descriptions',[]) if isinstance(d,dict))
+                rows.append({'doi':a.get('doi'),'url':a.get('url'),'publisher':a.get('publisher'),'resource_type':rt,'titles':titles,'descriptions':desc[:8000],'rightsList':a.get('rightsList'),'subjects':a.get('subjects'),'dates':a.get('dates'),'creators':a.get('creators')})
+              audit['datacite'][q]=rows
+            except Exception as e: audit['datacite'][q]={'error':repr(e)}
+
+          # Harvard Dataverse API. Search metadata and fetch file manifests + terms for likely candidates.
+          hbase='https://dataverse.harvard.edu'
+          seen={}
+          for q in terms:
+            try:
+              r=S.get(hbase+'/api/search',params={'q':q,'type':'dataset','per_page':100},timeout=90); r.raise_for_status(); js=r.json()
+              items=js.get('data',{}).get('items',[])
+              audit['harvard_dataverse'][q]=[{'name':i.get('name'),'url':i.get('url'),'global_id':i.get('global_id'),'description':i.get('description'),'published_at':i.get('published_at')} for i in items]
+              for i in items:
+                gid=i.get('global_id');
+                if not gid: continue
+                text=' '.join(str(i.get(k,'')) for k in ['name','description']).lower()
+                if not any(k in text for k in ['ibes','i/b/e/s','analyst','earnings','forecast','consensus']): continue
+                seen[gid]=i
+            except Exception as e: audit['harvard_dataverse'][q]={'error':repr(e)}
+          for gid,i in list(seen.items())[:100]:
+            rec={'repository':'Harvard Dataverse','global_id':gid,'name':i.get('name'),'url':i.get('url'),'description':i.get('description')}
+            try:
+              r=S.get(hbase+'/api/datasets/:persistentId/',params={'persistentId':gid},timeout=90); r.raise_for_status(); j=r.json().get('data',{})
+              lv=j.get('latestVersion',{})
+              rec['versionState']=lv.get('versionState'); rec['license']=lv.get('license'); rec['termsOfUse']=lv.get('termsOfUse'); rec['termsOfAccess']=lv.get('termsOfAccess'); rec['fileAccessRequest']=lv.get('fileAccessRequest')
+              files=[]
+              for f in lv.get('files',[]):
+                df=f.get('dataFile',{}); files.append({'id':df.get('id'),'filename':df.get('filename'),'contentType':df.get('contentType'),'filesize':df.get('filesize'),'restricted':f.get('restricted'),'description':f.get('description')})
+              rec['files']=files
+            except Exception as e: rec['error']=repr(e)
+            audit['candidates'].append(rec)
+
+          # OSF public API probes. Search endpoint availability and inspect returned nodes/registrations if supported.
+          for q in terms:
+            probes=[]
+            for url,params in [
+              ('https://api.osf.io/v2/search/',{'q':q}),
+              ('https://api.osf.io/v2/registrations/',{'filter[title]':q,'page[size]':100}),
+              ('https://api.osf.io/v2/nodes/',{'filter[title]':q,'page[size]':100}),
+            ]:
+              try:
+                r=S.get(url,params=params,timeout=60); item={'url':r.url,'status':r.status_code,'content_type':r.headers.get('content-type')}
+                if r.ok:
+                  try:
+                    j=r.json(); data=j.get('data',[]) if isinstance(j,dict) else []
+                    item['count']=len(data); item['items']=[{'id':x.get('id'),'type':x.get('type'),'attributes':{k:(x.get('attributes') or {}).get(k) for k in ['title','description','date_created','date_modified','public','registration']}} for x in data[:100]]
+                  except Exception as e: item['json_error']=repr(e)
+                else: item['text']=r.text[:1000]
+                probes.append(item)
+              except Exception as e: probes.append({'url':url,'error':repr(e)})
+            audit['osf_probe'][q]=probes
+
+          # Rank DataCite candidates by relevant text and open-rights hints.
+          ranked=[]; seen_doi=set()
+          for q,rows in audit['datacite'].items():
+            if not isinstance(rows,list): continue
+            for x in rows:
+              doi=x.get('doi');
+              if not doi or doi in seen_doi: continue
+              seen_doi.add(doi)
+              txt=(' '.join(x.get('titles') or [])+' '+(x.get('descriptions') or '')).lower()
+              score=sum(3 for k in ['i/b/e/s','ibes','earnings surprise','analyst forecast','analyst consensus'] if k in txt)+sum(1 for k in ['earnings','forecast','consensus','eps','revenue','sales'] if k in txt)
+              rights=' '.join(str(r) for r in (x.get('rightsList') or [])).lower()
+              openhint=any(k in rights for k in ['creative commons','cc-by','cc by','cc0','odc','open data commons'])
+              if score>=3: ranked.append({**x,'score':score,'open_rights_hint':openhint})
+          ranked.sort(key=lambda x:(x['open_rights_hint'],x['score']),reverse=True)
+          audit['ranked_datacite_candidates']=ranked[:300]
+
+          (out/'DATAVERSE_DATACITE_AUDIT.json').write_text(json.dumps(audit,indent=2,ensure_ascii=False),encoding='utf-8')
+          summary={
+            'datacite_counts':{q:(len(v) if isinstance(v,list) else 0) for q,v in audit['datacite'].items()},
+            'harvard_counts':{q:(len(v) if isinstance(v,list) else 0) for q,v in audit['harvard_dataverse'].items()},
+            'harvard_candidate_count':len(audit['candidates']),
+            'ranked_datacite':[{'doi':x.get('doi'),'publisher':x.get('publisher'),'title':(x.get('titles') or [''])[0],'url':x.get('url'),'score':x.get('score'),'open_rights_hint':x.get('open_rights_hint'),'rightsList':x.get('rightsList')} for x in ranked[:80]],
+            'osf_statuses':{q:[(p.get('status'),p.get('count'),p.get('url')) for p in probes] for q,probes in audit['osf_probe'].items()},
+            'harvard_candidates':[{'global_id':r.get('global_id'),'name':r.get('name'),'license':r.get('license'),'termsOfUse':r.get('termsOfUse'),'files':r.get('files')} for r in audit['candidates'][:80]],
+          }
+          print(json.dumps(summary,indent=2,ensure_ascii=False)[:250000])
+          PY
+      - name: Upload audit only
+        uses: actions/upload-artifact@v4
+        with:
+          name: eftm-v12-dataverse-datacite-audit
+          retention-days: 3
+          compression-level: 9
+          path: eftm_v12_dataverse_datacite/**
