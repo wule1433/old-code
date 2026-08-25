@@ -1,0 +1,69 @@
+name: EFTM v1.2 Figshare XLS audit
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install requests pandas xlrd openpyxl
+      - name: Inspect CC-BY XLS files
+        run: |
+          mkdir -p eftm_v12_figshare_xls
+          python - <<'PY'
+          import requests, pandas as pd, io, json
+          from pathlib import Path
+          out=Path('eftm_v12_figshare_xls')
+          ids=[24896198,24896207,24896222,24896192]
+          targets=['AMD','AAPL','MSFT','NVDA','AVGO']
+          S=requests.Session(); audit={}
+          for aid in ids:
+            m=S.get(f'https://api.figshare.com/v2/articles/{aid}',timeout=60).json()
+            rec={'title':m.get('title'),'doi':m.get('doi'),'license':m.get('license'),'description':m.get('description'),'files':[]}
+            for f in m.get('files',[]):
+              name=f.get('name',''); url=f.get('download_url')
+              fr={'name':name,'size':f.get('size')}
+              if url and (name.lower().endswith('.xls') or name.lower().endswith('.xlsx')):
+                try:
+                  b=S.get(url,timeout=120).content
+                  xls=pd.ExcelFile(io.BytesIO(b))
+                  fr['sheets']=[]
+                  for sh in xls.sheet_names:
+                    df=pd.read_excel(io.BytesIO(b),sheet_name=sh,header=None)
+                    # also try first row as header
+                    try: dh=pd.read_excel(io.BytesIO(b),sheet_name=sh)
+                    except Exception: dh=None
+                    sr={'sheet':sh,'shape':[int(df.shape[0]),int(df.shape[1])], 'raw_head':df.head(25).fillna('').astype(str).values.tolist()}
+                    if dh is not None:
+                      sr['columns']=list(map(str,dh.columns)); sr['head']=dh.head(25).fillna('').astype(str).to_dict('records')
+                      txt=dh.fillna('').astype(str)
+                      for t in targets:
+                        mask=txt.apply(lambda c:c.str.upper().eq(t)).any(axis=1)
+                        if mask.any(): sr.setdefault('target_hits',{})[t]=dh[mask].head(50).fillna('').astype(str).to_dict('records')
+                    # scan entire raw table for exact ticker tokens
+                    flat=df.fillna('').astype(str)
+                    for t in targets:
+                      mask=flat.apply(lambda c:c.str.upper().eq(t)).any(axis=1)
+                      if mask.any(): sr.setdefault('raw_target_hits',{})[t]=df[mask].head(50).fillna('').astype(str).values.tolist()
+                    fr['sheets'].append(sr)
+                except Exception as e: fr['error']=repr(e)
+              rec['files'].append(fr)
+            audit[str(aid)]=rec
+          (out/'FIGSHARE_XLS_AUDIT.json').write_text(json.dumps(audit,indent=2,ensure_ascii=False),encoding='utf-8')
+          print(json.dumps(audit,indent=2,ensure_ascii=False)[:250000])
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: eftm-v12-figshare-xls-audit
+          retention-days: 3
+          compression-level: 9
+          path: eftm_v12_figshare_xls/**
